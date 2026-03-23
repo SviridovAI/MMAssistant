@@ -1,0 +1,106 @@
+# ============================================
+# .gitignore for Python project with GUI interface
+# ============================================
+
+# 1. Basic Python exclusions
+# Python compilation files
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Cache directories
+__pycache__/
+.pytype/
+
+# Code coverage files
+.coverage
+.coverage.*
+
+# Profiling files
+profile
+*.prof
+
+# 2. Virtual environments
+venv/
+.venv/
+env/
+.env
+.env.local
+.env.*.local
+
+# 3. Configuration files
+config.json
+config.local.json
+*.local.json
+
+# 4. Test files and directories
+test_files/
+test_*.py
+*_test.py
+.pytest_cache/
+htmlcov/
+
+# 5. Temporary files and logs
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# 6. System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 7. IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# 8. Binary and executable files
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 9. Documentation and builds
+build/
+dist/
+*.egg-info/
+.eggs/
+sdist/
+wheels/
+pip-wheel-metadata/
+
+# 10. Dependency files
+Pipfile.lock
+poetry.lock
+requirements-dev.txt
+
+# Additional exclusions for GUI projects
+# Interface cache files
+*.ui~
+*.qrc~
+*.qmlc
+*.jsc
+
+# Resource files (if used)
+resources_rc.py
+*_rc.py
+
+# Development environment configuration files
+*.code-workspace
+
+# Operating system files
+*.orig
+*.rej
+
+# Other
+plans/
