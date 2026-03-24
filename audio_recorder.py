@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import numpy as np
 import pyaudiowpatch as pyaudio
 import traceback
@@ -95,6 +96,7 @@ class AudioRecorder:
         self.recording = False
         self.thread = None
         self.config = config or {}
+        self.stop_event = threading.Event()
 
     def _get_whisper_json_path(self, audio_path):
         """Возвращает ожидаемый путь к JSON-файлу Whisper для данного аудио."""
@@ -106,6 +108,7 @@ class AudioRecorder:
 
     def start_recording(self, save_path, blocksize=4096):
         self.recording = True
+        self.stop_event.clear()
         self.mp3_path = save_path
         self.blocksize = blocksize
         self.thread = threading.Thread(target=self._record)
@@ -114,6 +117,53 @@ class AudioRecorder:
 
     def stop_recording(self):
         self.recording = False
+        self.stop_event.set()
+        # Ожидание завершения потока с таймаутом
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():
+                # Поток все еще жив после таймаута - возможно зависание
+                # Логируем предупреждение, но не прерываем принудительно
+                pass
+
+    def _flush_with_timeout(self, encoder, timeout=5.0):
+        """
+        Выполняет encoder.flush() с ограничением по времени.
+
+        Args:
+            encoder: экземпляр lameenc.Encoder
+            timeout: максимальное время ожидания в секундах
+
+        Returns:
+            bytes или None: данные MP3 или None в случае таймаута/ошибки
+        """
+        import threading
+        import time
+
+        result = []
+        error = []
+
+        def worker():
+            try:
+                chunk = encoder.flush()
+                result.append(chunk)
+            except Exception as e:
+                error.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            # Поток все еще работает - зависание
+            return None
+        elif error:
+            # Произошла ошибка при flush
+            return None
+        else:
+            # Успешное завершение
+            return result[0] if result else None
 
     def _record(self):
         log_dir = os.path.join(os.path.dirname(self.mp3_path), "log")
@@ -219,8 +269,10 @@ class AudioRecorder:
             # --- Цикл записи ---
             debug_file.write("5. Начало цикла записи...\n")
             block_counter = 0
+            start_time = time.time()
+            last_log_time = start_time
 
-            while self.recording:
+            while self.recording and not self.stop_event.is_set():
                 try:
                     sys_result = sys_stream.read(
                         self.blocksize, exception_on_overflow=False
@@ -329,8 +381,28 @@ class AudioRecorder:
                     mp3_chunk = encoder.encode(mixed_int16.tobytes())
                     if mp3_chunk:
                         mp3_file.write(mp3_chunk)
+                        # Принудительный сброс буфера файловой системы каждые 10 блоков
+                        if block_counter % 10 == 0:
+                            try:
+                                mp3_file.flush()
+                                os.fsync(mp3_file.fileno())
+                                # Логируем размер файла для диагностики
+                                current_size = os.path.getsize(self.mp3_path)
+                                debug_file.write(
+                                    f"   Сброс буфера, размер файла: {current_size} байт\n"
+                                )
+                            except Exception as e:
+                                debug_file.write(f"   Ошибка при сбросе буфера: {e}\n")
 
                     block_counter += 1
+
+                    # Логирование прогресса каждые 100 блоков
+                    if block_counter % 100 == 0:
+                        current_time = time.time()
+                        elapsed = current_time - start_time
+                        debug_file.write(
+                            f"   Прогресс: {block_counter} блоков, время: {elapsed:.1f} сек\n"
+                        )
 
                 except Exception as e:
                     debug_file.write(f"   Ошибка в цикле: {e}\n")
@@ -339,10 +411,15 @@ class AudioRecorder:
             debug_file.write(f"6. Цикл завершён. Записано блоков: {block_counter}\n")
 
             # --- Финализация MP3 ---
-            mp3_chunk = encoder.flush()
+            debug_file.write("   Начало финализации MP3 (flush)...\n")
+            mp3_chunk = self._flush_with_timeout(encoder, timeout=5.0)
             if mp3_chunk:
                 mp3_file.write(mp3_chunk)
-            debug_file.write("   MP3 финализирован.\n")
+                debug_file.write("   MP3 финализирован успешно.\n")
+            else:
+                debug_file.write(
+                    "   ВНИМАНИЕ: flush завершился с таймаутом или ошибкой, данные могут быть потеряны.\n"
+                )
 
             # --- Закрытие ---
             mp3_file.close()
