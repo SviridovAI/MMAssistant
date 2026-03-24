@@ -72,7 +72,6 @@ class ConfigManager:
             key = keyring.get_password("MMAssistant", "llm_api_key")
             return key if key else None
         except keyring.errors.KeyringError as e:
-            print(f"Ошибка keyring: {e}")
             raise RuntimeError(f"Не удалось получить API ключ из keyring: {e}")
 
     def set_api_key(self, api_key):
@@ -83,7 +82,6 @@ class ConfigManager:
             keyring.set_password("MMAssistant", "llm_api_key", api_key)
             return True
         except keyring.errors.KeyringError as e:
-            print(f"Ошибка сохранения в keyring: {e}")
             raise RuntimeError(f"Не удалось сохранить API ключ в keyring: {e}")
 
     def has_api_key(self):
@@ -105,7 +103,6 @@ class ConfigManager:
 
             # Если есть ключ в config.json, удаляем его
             if "llm_api_key" in config:
-                print("Удаление старого API ключа из config.json...")
                 del config["llm_api_key"]
                 self.save(config)
                 return True
