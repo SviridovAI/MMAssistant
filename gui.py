@@ -31,7 +31,6 @@ from request_processor import (
 )
 
 
-# ==================== ОБРАБОТКА ЗАПРОСОВ ====================
 # ==================== ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ====================
 class App:
     PLACEHOLDER_TEXT = "Выбери промт из списка"
@@ -40,7 +39,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Whisper + LLM Обработчик")
+        self.root.title("Meeting Minutes Assistant")
         self.root.geometry("800x780")
         self.root.resizable(False, False)
 
@@ -137,7 +136,8 @@ class App:
             file_name = os.path.basename(full_path)
             self.audio_path.set(file_name)
         else:
-            self.audio_path.set(full_path if full_path else self.AUDIO_PLACEHOLDER_TEXT)
+            new_value = full_path if full_path else self.AUDIO_PLACEHOLDER_TEXT
+            self.audio_path.set(new_value)
 
     def set_prompt_path(self, full_path):
         """Устанавливает полный путь к файлу промпта и обновляет отображение в комбобоксе.
@@ -151,7 +151,8 @@ class App:
             file_name = os.path.basename(full_path)
             self.prompt_path.set(file_name)
         else:
-            self.prompt_path.set(full_path if full_path else self.PLACEHOLDER_TEXT)
+            new_value = full_path if full_path else self.PLACEHOLDER_TEXT
+            self.prompt_path.set(new_value)
 
     def set_context_path(self, full_path):
         """Устанавливает полный путь к файлу контекста и обновляет отображение в комбобоксе.
@@ -165,9 +166,30 @@ class App:
             file_name = os.path.basename(full_path)
             self.context_path.set(file_name)
         else:
-            self.context_path.set(
-                full_path if full_path else self.CONTEXT_PLACEHOLDER_TEXT
-            )
+            new_value = full_path if full_path else self.CONTEXT_PLACEHOLDER_TEXT
+            self.context_path.set(new_value)
+
+    def clear_input_fields(self):
+        """Очищает поля ввода аудио, промпта и контекста после успешной обработки.
+
+        Устанавливает значения placeholder'ов в StringVar и очищает фактические пути.
+        Папка сохранения результата (self.output_folder) не очищается.
+        """
+        # Устанавливаем placeholder'ы
+        self.audio_path.set(self.AUDIO_PLACEHOLDER_TEXT)
+        self.prompt_path.set(self.PLACEHOLDER_TEXT)
+        self.context_path.set(self.CONTEXT_PLACEHOLDER_TEXT)
+
+        # Очищаем фактические пути через вызовы существующих методов
+        self.set_audio_path("")
+        self.set_prompt_path("")
+        self.set_context_path("")
+
+        # Папка сохранения не очищается (self.output_folder остается как есть)
+        # Опционально: обновляем списки файлов в комбобоксах
+        self.update_audio_list()
+        self.update_prompt_list()
+        self.update_context_list()
 
     def get_audio_path(self):
         """Возвращает полный путь к аудиофайлу для обработки."""
@@ -735,6 +757,8 @@ class App:
                     f"Whisper JSON: {j}\nLLM MD: {m}",
                 ),
             )
+            # Очистка полей ввода после успешной обработки
+            self.root.after(0, self.clear_input_fields)
 
         except Exception as e:
             self.log(f"ОШИБКА: {e}")
@@ -776,6 +800,8 @@ class App:
                         "Готово", f"Результат уже существовал:\n{p}"
                     ),
                 )
+                # Очистка полей ввода после успешной обработки
+                self.root.after(0, self.clear_input_fields)
             else:
                 self.log("Отправка аудио на Whisper ASR...")
                 whisper_result = transcribe_audio(audio_path, self.config)
@@ -796,6 +822,8 @@ class App:
                         "Готово", f"Результат сохранён в:\n{p}"
                     ),
                 )
+                # Очистка полей ввода после успешной обработки
+                self.root.after(0, self.clear_input_fields)
         except Exception as e:
             self.log(f"ОШИБКА: {e}")
             self.root.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
