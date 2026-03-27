@@ -41,6 +41,7 @@ debug_*.py
 *_test.py
 .pytest_cache/
 htmlcov/
+*_backup.py
 
 # 5. Temporary files and logs
 *.log
