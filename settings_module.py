@@ -298,7 +298,6 @@ class LLMTab:
         return current_key
 
 
-
 class WhisperTab:
     """Вкладка настроек Whisper."""
 
@@ -491,7 +490,6 @@ class WhisperTab:
             "whisper_language": self.language_var.get(),
             "whisper_remove_words": self.remove_words_var.get(),
         }
-
 
 
 class FoldersTab:
@@ -711,6 +709,279 @@ class FoldersTab:
         }
 
 
+class AudioTab:
+    """Вкладка настроек аудиоустройств."""
+
+    def __init__(self, parent, config):
+        self.parent = parent
+        self.config = config
+
+        self.create_widgets()
+        self.load_current_values()
+        self.refresh_devices()
+
+    def create_widgets(self):
+        """Создает все элементы управления вкладки."""
+        row = 0
+
+        # Выходное устройство (системный звук)
+        ttk.Label(self.parent, text="Выходное устройство (воспроизведение):").grid(
+            row=row, column=0, sticky="w", padx=5, pady=5
+        )
+
+        self.output_var = tk.StringVar()
+        self.output_combo = ttk.Combobox(
+            self.parent,
+            textvariable=self.output_var,
+            values=[],  # Будет заполнено через refresh_devices
+            state="readonly",
+            width=50,
+        )
+        self.output_combo.grid(row=row, column=1, sticky="ew", padx=5, pady=5)
+        self.output_combo.bind("<<ComboboxSelected>>", self.on_output_selected)
+        row += 1
+
+        # Входное устройство (микрофон)
+        ttk.Label(self.parent, text="Входное устройство (микрофон):").grid(
+            row=row, column=0, sticky="w", padx=5, pady=5
+        )
+
+        self.input_var = tk.StringVar()
+        self.input_combo = ttk.Combobox(
+            self.parent,
+            textvariable=self.input_var,
+            values=[],  # Будет заполнено через refresh_devices
+            state="readonly",
+            width=50,
+        )
+        self.input_combo.grid(row=row, column=1, sticky="ew", padx=5, pady=5)
+        self.input_combo.bind("<<ComboboxSelected>>", self.on_input_selected)
+        row += 1
+
+        # Кнопка обновления списка устройств
+        self.refresh_btn = ttk.Button(
+            self.parent, text="Обновить список устройств", command=self.refresh_devices
+        )
+        self.refresh_btn.grid(row=row, column=0, padx=5, pady=10)
+
+        # Чекбокс автообновления
+        self.auto_refresh_var = tk.BooleanVar(value=False)
+        self.auto_refresh_cb = ttk.Checkbutton(
+            self.parent,
+            text="Автообновление списка устройств",
+            variable=self.auto_refresh_var,
+        )
+        self.auto_refresh_cb.grid(row=row, column=1, sticky="w", padx=5, pady=10)
+        row += 1
+
+        # Панель управления профилями удалена
+
+        # Статусная строка
+        self.status_var = tk.StringVar(value="Готово")
+        self.status_label = ttk.Label(self.parent, textvariable=self.status_var)
+        self.status_label.grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=5, pady=5
+        )
+
+        # Настройка весов колонок
+        self.parent.grid_columnconfigure(1, weight=1)
+
+    def load_current_values(self):
+        """Загружает текущие значения из конфигурации."""
+        # Загружаем сохраненные устройства
+        self.output_var.set(self.config.get("audio_output_device", ""))
+        self.input_var.set(self.config.get("audio_input_device", ""))
+        self.auto_refresh_var.set(self.config.get("audio_auto_refresh_devices", True))
+
+    def refresh_devices(self):
+        """Обновляет списки доступных аудиоустройств."""
+        try:
+            # Импортируем AudioRecorder здесь, чтобы избежать циклических зависимостей
+            from audio_recorder import AudioRecorder
+
+            # Создаем временный экземпляр AudioRecorder для получения устройств
+            recorder = AudioRecorder(lambda: None, self.config)
+            devices_info = recorder.get_available_devices(force_refresh=True)
+
+            output_devices = devices_info.get("output_devices", [])
+            input_devices = devices_info.get("input_devices", [])
+
+            # Формируем списки для комбобоксов
+            output_names = [
+                f"{d['name']} (индекс {d['index']})" for d in output_devices
+            ]
+            input_names = [f"{d['name']} (индекс {d['index']})" for d in input_devices]
+
+            # Обновляем комбобоксы
+            self.output_combo["values"] = output_names
+            self.input_combo["values"] = input_names
+
+            # Выбираем устройства по умолчанию если не выбраны
+            default_output_idx = devices_info.get("default_output_index")
+            default_input_idx = devices_info.get("default_input_index")
+
+            if not self.output_var.get() and default_output_idx is not None:
+                for d in output_devices:
+                    if d["index"] == default_output_idx:
+                        self.output_var.set(f"{d['name']} (индекс {d['index']})")
+                        break
+
+            if not self.input_var.get() and default_input_idx is not None:
+                for d in input_devices:
+                    if d["index"] == default_input_idx:
+                        self.input_var.set(f"{d['name']} (индекс {d['index']})")
+                        break
+
+            self.set_status(
+                f"Найдено {len(output_devices)} выходных и {len(input_devices)} входных устройств",
+                "success",
+            )
+
+        except Exception as e:
+            self.set_status(f"Ошибка при обновлении устройств: {str(e)}", "error")
+
+    def check_devices_available(self):
+        """
+        Проверяет доступность аудиоустройств (микрофона и выходных устройств).
+        Возвращает словарь с информацией о доступности.
+        """
+        try:
+            from audio_recorder import AudioRecorder
+
+            # Создаем временный экземпляр AudioRecorder для проверки
+            recorder = AudioRecorder(lambda: None, self.config)
+            devices_info = recorder.check_devices_available()
+
+            # Формируем понятный результат
+            result = {
+                "microphone_available": devices_info.get("microphone_available", False),
+                "loopback_available": devices_info.get("loopback_available", False),
+                "wasapi_available": devices_info.get("wasapi_available", False),
+                "microphone_count": len(devices_info.get("microphone_devices", [])),
+                "loopback_count": len(devices_info.get("loopback_devices", [])),
+                "default_microphone": devices_info.get("default_microphone"),
+                "default_speakers": devices_info.get("default_speakers"),
+                "errors": devices_info.get("errors", []),
+            }
+
+            # Логируем результат
+            status_msg = []
+            if result["microphone_available"]:
+                status_msg.append(f"Микрофоны: {result['microphone_count']} доступно")
+            else:
+                status_msg.append("Микрофоны: недоступны")
+
+            if result["loopback_available"]:
+                status_msg.append(
+                    f"Loopback устройств: {result['loopback_count']} доступно"
+                )
+            else:
+                status_msg.append("Loopback устройства: недоступны")
+
+            self.set_status("; ".join(status_msg), "info")
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Ошибка проверки устройств: {str(e)}"
+            self.set_status(error_msg, "error")
+            return {
+                "microphone_available": False,
+                "loopback_available": False,
+                "wasapi_available": False,
+                "microphone_count": 0,
+                "loopback_count": 0,
+                "errors": [error_msg],
+            }
+
+    def on_output_selected(self, event):
+        """Обработчик выбора выходного устройства."""
+        device_name = self.output_var.get()
+        self.set_status(f"Выбрано выходное устройство: {device_name}", "info")
+
+    def on_input_selected(self, event):
+        """Обработчик выбора входного устройства."""
+        device_name = self.input_var.get()
+        self.set_status(f"Выбрано входное устройство: {device_name}", "info")
+
+    def set_status(self, message, status_type="info"):
+        """Устанавливает статусное сообщение."""
+        self.status_var.set(message)
+
+        colors = {
+            "info": "black",
+            "success": "green",
+            "warning": "orange",
+            "error": "red",
+        }
+
+        color = colors.get(status_type, "black")
+        self.status_label.config(foreground=color)
+
+    def _parse_device_string(self, device_str):
+        """Извлекает имя и индекс устройства из строки формата 'Имя (индекс X)'."""
+        if not device_str:
+            return "", -1
+
+        # Пытаемся найти индекс в скобках
+        import re
+
+        match = re.search(r"\(индекс\s+(\d+)\)", device_str)
+        if match:
+            index = int(match.group(1))
+            # Извлекаем имя без индекса
+            name = re.sub(r"\s*\(индекс\s+\d+\)", "", device_str).strip()
+            return name, index
+        else:
+            # Если индекс не найден, возвращаем всю строку как имя
+            return device_str, -1
+
+    def _get_device_index(self, device_str, device_type="output"):
+        """Возвращает индекс устройства по строке выбора."""
+        name, index = self._parse_device_string(device_str)
+        if index >= 0:
+            return index
+
+        # Если индекс не найден, пытаемся найти устройство по имени в кэше
+        try:
+            from audio_recorder import AudioRecorder
+
+            recorder = AudioRecorder(lambda: None, self.config)
+            devices_info = recorder.get_available_devices(force_refresh=False)
+            devices = devices_info.get(f"{device_type}_devices", [])
+            for d in devices:
+                if d["name"] == name:
+                    return d["index"]
+        except:
+            pass
+        return -1
+
+    def get_values(self):
+        """Возвращает текущие значения настроек."""
+        output_str = self.output_var.get()
+        input_str = self.input_var.get()
+
+        output_name, output_idx = self._parse_device_string(output_str)
+        input_name, input_idx = self._parse_device_string(input_str)
+
+        # Если индекс не найден, пытаемся получить его
+        if output_idx < 0:
+            output_idx = self._get_device_index(output_str, "output")
+        if input_idx < 0:
+            input_idx = self._get_device_index(input_str, "input")
+
+        return {
+            "audio_output_device": output_name,
+            "audio_input_device": input_name,
+            "audio_output_device_id": output_idx,
+            "audio_input_device_id": input_idx,
+            "audio_auto_refresh_devices": self.auto_refresh_var.get(),
+        }
+
+    def cleanup(self):
+        """Очистка ресурсов AudioTab (заглушка, функциональность удалена)."""
+        pass
+
 
 class SettingsDialog:
     """Модальное окно настроек с вкладками."""
@@ -727,10 +998,12 @@ class SettingsDialog:
 
     def setup_dialog(self):
         self.dialog.title("Настройки MMAssistant")
-        self.dialog.geometry("650x550")
+        self.dialog.geometry("700x400")
         self.dialog.resizable(False, False)
         self.dialog.transient(self.parent)
         self.dialog.grab_set()
+        # Обработчик закрытия окна через крестик
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
     def create_notebook(self):
         self.notebook = ttk.Notebook(self.dialog)
@@ -739,15 +1012,18 @@ class SettingsDialog:
         self.llm_frame = ttk.Frame(self.notebook)
         self.whisper_frame = ttk.Frame(self.notebook)
         self.folders_frame = ttk.Frame(self.notebook)
+        self.audio_frame = ttk.Frame(self.notebook)
 
         self.notebook.add(self.llm_frame, text="LLM")
         self.notebook.add(self.whisper_frame, text="Whisper")
         self.notebook.add(self.folders_frame, text="Папки")
+        self.notebook.add(self.audio_frame, text="Аудио")
 
         # Инициализация вкладок
         self.llm_tab = LLMTab(self.llm_frame, self.config, self.api_key)
         self.whisper_tab = WhisperTab(self.whisper_frame, self.config)
         self.folders_tab = FoldersTab(self.folders_frame, self.config)
+        self.audio_tab = AudioTab(self.audio_frame, self.config)
 
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -776,11 +1052,13 @@ class SettingsDialog:
             # Сохраняем остальные настройки
             whisper_values = self.whisper_tab.get_values()
             folders_values = self.folders_tab.get_values()
+            audio_values = self.audio_tab.get_values()
 
             # Обновление конфигурации
             self.config.update(llm_values)
             self.config.update(whisper_values)
             self.config.update(folders_values)
+            self.config.update(audio_values)
 
             # Сохранение в файл
             save_config(self.config)
@@ -793,5 +1071,23 @@ class SettingsDialog:
             )
 
     def on_cancel(self):
+        self.cleanup_tabs()
         self.dialog.destroy()
 
+    def cleanup_tabs(self):
+        """Очистка ресурсов всех вкладок перед закрытием диалога."""
+        # Очищаем ресурсы AudioTab (останавливаем мониторинг, уничтожаем VU-метр)
+        if hasattr(self, "audio_tab"):
+            try:
+                self.audio_tab.cleanup()
+            except Exception as e:
+                print(f"Ошибка при очистке AudioTab: {e}")
+
+        # Дополнительно можно очистить другие вкладки при необходимости
+        # if hasattr(self, 'llm_tab'):
+        #     self.llm_tab.cleanup()
+
+    def on_window_close(self):
+        """Обработчик закрытия окна через крестик."""
+        self.cleanup_tabs()
+        self.dialog.destroy()

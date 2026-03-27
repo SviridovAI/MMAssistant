@@ -1,0 +1,199 @@
+{
+  "version": "1.1",
+  "created_at": "2026-03-27T08:46:19.576690Z",
+  "profiles": [
+    {
+      "name": "По умолчанию",
+      "scenario": "default",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 0.0,
+        "microphone_max_gain": 100.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": false,
+        "audio_normalization_peak_target": 0.5,
+        "audio_normalization_level": -6.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138062Z",
+        "last_used": "2026-03-26T20:45:29.777227Z",
+        "last_modified": "2026-03-26T20:28:10.138071Z",
+        "usage_count": 5,
+        "device_fingerprint": "b14a7b80",
+        "description": "Стандартные настройки системы",
+        "tags": [
+          "default",
+          "system"
+        ]
+      }
+    },
+    {
+      "name": "Студийная запись",
+      "scenario": "studio_recording",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 0.0,
+        "microphone_max_gain": 50.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": true,
+        "audio_normalization_peak_target": 0.7,
+        "audio_normalization_level": -3.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138080Z",
+        "last_used": "2026-03-26T20:28:10.139650Z",
+        "last_modified": "2026-03-26T20:28:10.138083Z",
+        "usage_count": 1,
+        "device_fingerprint": "b14a7b80",
+        "description": "Высокое качество записи, низкое усиление, точный контроль уровней",
+        "tags": [
+          "studio",
+          "recording",
+          "high-quality"
+        ]
+      }
+    },
+    {
+      "name": "Встречи/Конференции",
+      "scenario": "meeting_conference",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 10.0,
+        "microphone_max_gain": 100.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": true,
+        "audio_normalization_peak_target": 0.5,
+        "audio_normalization_level": -6.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138088Z",
+        "last_used": "2026-03-27T08:46:19.576650Z",
+        "last_modified": "2026-03-26T20:28:10.138090Z",
+        "usage_count": 1,
+        "device_fingerprint": "b14a7b80",
+        "description": "Оптимизировано для голосовой связи, среднее усиление",
+        "tags": [
+          "meeting",
+          "conference",
+          "voice"
+        ]
+      }
+    },
+    {
+      "name": "Стриминг",
+      "scenario": "streaming",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 15.0,
+        "microphone_max_gain": 150.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": true,
+        "audio_normalization_peak_target": 0.6,
+        "audio_normalization_level": -6.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138093Z",
+        "last_used": "2026-03-26T20:28:10.138094Z",
+        "last_modified": "2026-03-26T20:28:10.138095Z",
+        "usage_count": 0,
+        "device_fingerprint": "b14a7b80",
+        "description": "Оптимизировано для потоковой передачи, баланс качества и громкости",
+        "tags": [
+          "streaming",
+          "broadcast",
+          "live"
+        ]
+      }
+    },
+    {
+      "name": "Игры",
+      "scenario": "gaming",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 20.0,
+        "microphone_max_gain": 200.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": false,
+        "audio_normalization_peak_target": 0.5,
+        "audio_normalization_level": -6.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138098Z",
+        "last_used": "2026-03-26T20:28:10.138099Z",
+        "last_modified": "2026-03-26T20:28:10.138100Z",
+        "usage_count": 0,
+        "device_fingerprint": "b14a7b80",
+        "description": "Высокое усиление для геймерских гарнитур",
+        "tags": [
+          "gaming",
+          "headset",
+          "high-gain"
+        ]
+      }
+    },
+    {
+      "name": "Тестовый профиль",
+      "scenario": "custom",
+      "device_settings": {
+        "audio_output_device": "",
+        "audio_input_device": "",
+        "audio_output_device_id": -1,
+        "audio_input_device_id": -1,
+        "audio_auto_refresh_devices": true
+      },
+      "microphone_settings": {
+        "microphone_gain_db": 25.0,
+        "microphone_max_gain": 100.0,
+        "microphone_preview_enabled": false,
+        "microphone_preview_volume": 0.8,
+        "audio_normalization_enabled": false,
+        "audio_normalization_peak_target": 0.5,
+        "audio_normalization_level": -6.0
+      },
+      "metadata": {
+        "created_at": "2026-03-26T20:28:10.138987Z",
+        "last_used": "2026-03-26T20:28:10.138991Z",
+        "last_modified": "2026-03-26T20:28:10.140324Z",
+        "usage_count": 0,
+        "device_fingerprint": "b14a7b80",
+        "description": "Обновленное описание",
+        "tags": []
+      }
+    }
+  ]
+}
