@@ -37,6 +37,7 @@ config.local.json
 # 4. Test files and directories
 test_files/
 test_*.py
+debug_*.py
 *_test.py
 .pytest_cache/
 htmlcov/

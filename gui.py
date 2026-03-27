@@ -9,6 +9,7 @@ from pathlib import Path
 # Импорт модуля записи аудио
 from audio_recorder import AudioRecorder
 
+
 # Импорт модуля конфигурации
 from config_manager import (
     load_config,
@@ -48,7 +49,8 @@ class App:
         self.prompt_path = tk.StringVar(value=self.PLACEHOLDER_TEXT)
         self.context_path = tk.StringVar(value=self.CONTEXT_PLACEHOLDER_TEXT)
         self.output_folder = tk.StringVar(
-            value=self.config.get("default_output_folder", "")
+            value=self.config.get("save_path")
+            or self.config.get("default_output_folder", "")
         )
 
         # Фактический полный путь к аудиофайлу (для обработки)
@@ -74,6 +76,10 @@ class App:
         self.prompt_path.trace("w", self._check_ready)
         self.context_path.trace("w", self._check_ready)
         self.output_folder.trace("w", self._check_ready)
+
+        # Атрибут для хранения пользовательского выбора пути сохранения
+        # Приоритетнее значения из config.json
+        self.user_selected_save_path = None
 
         self.create_widgets()
 
@@ -258,6 +264,8 @@ class App:
 
         # Обновляем конфигурацию
         self.config = load_config()
+        # Обновляем конфигурацию в AudioRecorder чтобы использовать новые настройки аудио
+        self.recorder.config = self.config
         self.log("Настройки обновлены")
 
     def _check_ready(self, *args):
@@ -584,11 +592,15 @@ class App:
         folder = filedialog.askdirectory(
             title="Выберите папку для сохранения",
             initialdir=self.output_folder.get()
+            or self.config.get("save_path")
             or self.config.get("default_output_folder", ""),
         )
         if folder:
             self.output_folder.set(folder)
-            self.config["default_output_folder"] = folder
+            # Сохраняем пользовательский выбор как приоритетный путь
+            self.user_selected_save_path = folder
+            # Не обновляем config сразу, чтобы не перезаписывать значение из файла
+            # config будет обновлен при сохранении настроек или завершении работы
 
     def save_current_config(self):
         current_on_disk = load_config()
@@ -602,6 +614,13 @@ class App:
         for key in safe_keys:
             if key in self.config:
                 current_on_disk[key] = self.config[key]
+
+        # Если пользователь выбрал новый путь сохранения, сохраняем его
+        if self.user_selected_save_path:
+            current_on_disk["default_output_folder"] = self.user_selected_save_path
+            # Также сохраняем в save_path для совместимости с заданием
+            current_on_disk["save_path"] = self.user_selected_save_path
+
         save_config(current_on_disk)
         self.config = current_on_disk
         self.log("Конфигурация сохранена в файл.")
@@ -653,6 +672,7 @@ class App:
         self.record_btn.config(text="Начать запись", bg="lightcoral")
         self.record_status.config(text="Остановка...", fg="blue")
         self.log("Остановка записи...")
+
         self.recorder.stop_recording()
 
     def on_recording_finished(self, success, filepath, error_msg):
@@ -685,9 +705,16 @@ class App:
             messagebox.showerror("Ошибка", "Выберите аудиофайл и файл с промптом.")
             return
         if not out_folder:
-            out_folder = self.config.get("default_output_folder", "")
-            if not out_folder:
-                out_folder = os.path.dirname(audio)
+            # Сначала проверяем пользовательский выбор
+            if self.user_selected_save_path:
+                out_folder = self.user_selected_save_path
+            else:
+                # Проверяем save_path, затем default_output_folder
+                out_folder = self.config.get("save_path") or self.config.get(
+                    "default_output_folder", ""
+                )
+                if not out_folder:
+                    out_folder = os.path.dirname(audio)
             self.output_folder.set(out_folder)
 
         self.process_btn.config(state="disabled")
@@ -748,7 +775,10 @@ class App:
             saved_path = save_md_file(cleaned_response, output_folder, base_name)
             self.log(f"Результат LLM сохранён в MD: {saved_path}")
 
+            # Сохраняем использованный путь как пользовательский выбор
+            self.user_selected_save_path = output_folder
             self.config["default_output_folder"] = output_folder
+            self.config["save_path"] = output_folder  # Для совместимости с заданием
             self.log("Обработка завершена успешно!")
             self.root.after(
                 0,
