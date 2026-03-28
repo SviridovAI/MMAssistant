@@ -21,6 +21,53 @@ def resample_audio(data, ratio, resampler=None):
     return resampler.process(data, ratio)
 
 
+# ==================== ОКОННЫЕ ФУНКЦИИ ====================
+def apply_window(data, window_type="hann", strength=0.3):
+    """
+    Применяет оконную функцию к данным для сглаживания краев.
+
+    Args:
+        data: numpy array с аудиоданными
+        window_type: тип окна ("hann", "hamming", "blackman", "tukey")
+        strength: сила применения окна (0.0 - 1.0), где 1.0 - полное окно
+    """
+    n = len(data)
+    if n < 2 or strength <= 0:
+        return data
+
+    # Создаем окно
+    if window_type == "hann":
+        # Окно Ханна (менее агрессивное)
+        window = 0.5 * (1 - np.cos(2 * np.pi * np.arange(n) / (n - 1)))
+    elif window_type == "hamming":
+        # Окно Хемминга
+        window = 0.54 - 0.46 * np.cos(2 * np.pi * np.arange(n) / (n - 1))
+    elif window_type == "blackman":
+        # Окно Блэкмана
+        window = (
+            0.42
+            - 0.5 * np.cos(2 * np.pi * np.arange(n) / (n - 1))
+            + 0.08 * np.cos(4 * np.pi * np.arange(n) / (n - 1))
+        )
+    elif window_type == "tukey":
+        # Окно Тьюки (более мягкое, затухает только края)
+        alpha = 0.5  # Параметр Тьюки (0.5 - умеренное затухание)
+        window = np.ones(n)
+        r = int(alpha * (n - 1) / 2)
+        if r > 0:
+            window[:r] = 0.5 * (1 + np.cos(np.pi * (np.arange(r) / r - 1)))
+            window[-r:] = 0.5 * (1 + np.cos(np.pi * (np.arange(r) / r)))
+    else:
+        # Прямоугольное окно (без изменений)
+        return data
+
+    # Применяем силу окна: смешиваем с прямоугольным окном
+    if strength < 1.0:
+        window = window * strength + (1 - strength)
+
+    return data * window
+
+
 # ==================== НОРМАЛИЗАЦИЯ АУДИО ====================
 def normalize_audio(data, target_level_db=-3.0, eps=1e-8, max_gain_db=40.0):
     """
@@ -93,42 +140,595 @@ def normalize_audio_peak(data, target_peak=0.9, eps=1e-8, max_gain=100.0):
 
 # ==================== ЗАПИСЬ ЗВУКА ====================
 class AudioRecorder:
+    """Новая система записи аудио с ресемплингом в реальном времени."""
+
     def __init__(self, on_finish_callback, config=None):
         self.on_finish = on_finish_callback
         self.recording = False
         self.thread = None
         self.config = config or {}
+        # Устанавливаем значения по умолчанию для конфига
+        self.config.setdefault(
+            "apply_window", False
+        )  # Отключаем оконные функции по умолчанию
+        self.config.setdefault("window_type", "hann")
+        self.config.setdefault(
+            "window_strength", 0.3
+        )  # Менее агрессивное окно по умолчанию
+        self.config.setdefault(
+            "window_mic_only", True
+        )  # Применять окно только к микрофону
+        self.config.setdefault("blocksize", 16384)
         self.stop_event = threading.Event()
-        self._force_cleanup_resources = {}
-        # Буфер для мониторинга VU-метра
-        self.recent_audio_buffer = (
-            None  # последние аудиоданные (форма (samples, channels))
-        )
+
+        # Ресурсы для очистки
+        self._resources = {
+            "pyaudio_instance": None,
+            "sys_stream": None,
+            "mic_stream": None,
+            "mp3_file": None,
+            "encoder": None,
+            "debug_file": None,
+        }
+
+        # Буфер для мониторинга
+        self.recent_audio_buffer = None
         self.recent_audio_lock = threading.Lock()
 
-    def _get_whisper_json_path(self, audio_path):
-        """Возвращает ожидаемый путь к JSON-файлу Whisper для данного аудио."""
-        folder = self.config.get("whisper_output_folder", "")
-        if not folder:
-            folder = os.path.dirname(audio_path)
-        base_name = Path(audio_path).stem
-        return os.path.join(folder, f"{base_name}.json")
+        # Частоты дискретизации
+        self.base_sample_rate = None
+        self.sys_sample_rate = None
+        self.mic_sample_rate = None
+
+        # Ресемплеры
+        self.sys_resampler = None
+        self.mic_resampler = None
+
+        # Статистика
+        self.stats = {
+            "sys_samples": 0,
+            "mic_samples": 0,
+            "sys_resampled": 0,
+            "mic_resampled": 0,
+            "start_time": None,
+            "end_time": None,
+        }
+
+    def _determine_sample_rates(self, p):
+        """Определяет частоты дискретизации системного звука и микрофона."""
+        try:
+            # Получаем информацию о WASAPI
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+
+            # Получаем устройства по умолчанию
+            default_speakers = p.get_device_info_by_index(
+                wasapi_info["defaultOutputDevice"]
+            )
+            default_mic = p.get_default_input_device_info()
+
+            # Частота дискретизации системного звука (loopback)
+            sys_sample_rate = float(default_speakers.get("defaultSampleRate", 44100.0))
+
+            # Частота дискретизации микрофона
+            mic_sample_rate = float(default_mic.get("defaultSampleRate", 44100.0))
+
+            # Базовая частота - наименьшая из двух
+            base_sample_rate = min(sys_sample_rate, mic_sample_rate)
+
+            logging.info(f"Частота системного звука: {sys_sample_rate} Hz")
+            logging.info(f"Частота микрофона: {mic_sample_rate} Hz")
+            logging.info(f"Базовая частота записи: {base_sample_rate} Hz")
+
+            return base_sample_rate, sys_sample_rate, mic_sample_rate
+
+        except Exception as e:
+            logging.error(f"Ошибка при определении частот дискретизации: {e}")
+            # Возвращаем значения по умолчанию
+            return 44100.0, 44100.0, 44100.0
+
+    def _setup_resamplers(self):
+        """Настраивает ресемплеры для потоков."""
+        if self.sys_sample_rate != self.base_sample_rate:
+            ratio = self.base_sample_rate / self.sys_sample_rate
+            self.sys_resampler = samplerate.Resampler("sinc_fastest", channels=1)
+            logging.info(
+                f"Ресемплер системного звука: {self.sys_sample_rate} -> {self.base_sample_rate} (ratio: {ratio:.4f})"
+            )
+        else:
+            self.sys_resampler = None
+            logging.info("Ресемплинг системного звука не требуется")
+
+        if self.mic_sample_rate != self.base_sample_rate:
+            ratio = self.base_sample_rate / self.mic_sample_rate
+            self.mic_resampler = samplerate.Resampler("sinc_fastest", channels=1)
+            logging.info(
+                f"Ресемплер микрофона: {self.mic_sample_rate} -> {self.base_sample_rate} (ratio: {ratio:.4f})"
+            )
+        else:
+            self.mic_resampler = None
+            logging.info("Ресемплинг микрофона не требуется")
+
+    def _convert_to_mono(self, data, channels):
+        """Преобразует многоканальные данные в моно."""
+        if channels == 1:
+            return data
+
+        # Если данные имеют форму (samples, channels)
+        if len(data.shape) == 2 and data.shape[1] == channels:
+            return np.mean(data, axis=1)
+        # Если данные имеют форму (channels, samples) - маловероятно для PyAudio
+        elif len(data.shape) == 2 and data.shape[0] == channels:
+            return np.mean(data, axis=0)
+        else:
+            # Неизвестный формат, возвращаем как есть
+            logging.warning(
+                f"Неизвестный формат данных: {data.shape}, channels={channels}"
+            )
+            return data
+
+    def _resample_if_needed(self, data, resampler, original_rate, target_rate):
+        """Выполняет ресемплинг данных если требуется."""
+        if resampler is None or original_rate == target_rate:
+            return data
+
+        ratio = target_rate / original_rate
+        try:
+            resampled = resampler.process(data, ratio)
+            return resampled
+        except Exception as e:
+            logging.error(f"Ошибка ресемплинга: {e}")
+            return data
+
+    def _find_loopback_device(self, p):
+        """Находит loopback устройство для захвата системного звука."""
+        # Пробуем использовать сохраненные настройки
+        audio_output_device_id = self.config.get("audio_output_device_id", -1)
+        audio_output_device = self.config.get("audio_output_device", "")
+
+        # Сначала по индексу
+        if audio_output_device_id >= 0:
+            try:
+                device = p.get_device_info_by_index(audio_output_device_id)
+                for loopback in p.get_loopback_device_info_generator():
+                    if loopback["index"] == audio_output_device_id:
+                        logging.info(f"Найдено loopback по индексу: {loopback['name']}")
+                        return loopback
+            except Exception as e:
+                logging.warning(
+                    f"Ошибка при доступе к устройству {audio_output_device_id}: {e}"
+                )
+
+        # Затем по имени
+        if audio_output_device:
+            for loopback in p.get_loopback_device_info_generator():
+                if audio_output_device.lower() in loopback["name"].lower():
+                    logging.info(f"Найдено loopback по имени: {loopback['name']}")
+                    return loopback
+
+        # Пытаемся найти loopback устройство, соответствующее активному устройству вывода по умолчанию
+        try:
+            # Получаем информацию о WASAPI
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_output_index = wasapi_info["defaultOutputDevice"]
+            default_output = p.get_device_info_by_index(default_output_index)
+            default_output_name = default_output["name"]
+
+            logging.info(
+                f"Активное устройство вывода по умолчанию: {default_output_name}"
+            )
+
+            # Ищем loopback устройство с похожим именем
+            for loopback in p.get_loopback_device_info_generator():
+                loopback_name = loopback["name"]
+                # Убираем "[Loopback]" из имени для сравнения
+                clean_loopback_name = loopback_name.replace("[Loopback]", "").strip()
+                if (
+                    clean_loopback_name in default_output_name
+                    or default_output_name in clean_loopback_name
+                ):
+                    logging.info(
+                        f"Найдено соответствующее loopback устройство: {loopback_name}"
+                    )
+                    return loopback
+
+                # Также проверяем частичное совпадение
+                common_words = [
+                    "speakers",
+                    "headphones",
+                    "audio",
+                    "device",
+                    "maxwell",
+                    "game",
+                    "chat",
+                ]
+                for word in common_words:
+                    if (
+                        word in default_output_name.lower()
+                        and word in loopback_name.lower()
+                    ):
+                        logging.info(
+                            f"Найдено loopback по ключевому слову '{word}': {loopback_name}"
+                        )
+                        return loopback
+        except Exception as e:
+            logging.warning(
+                f"Не удалось найти loopback для активного устройства вывода: {e}"
+            )
+
+        # Собираем все доступные loopback устройства для выбора
+        loopback_devices = list(p.get_loopback_device_info_generator())
+        if loopback_devices:
+            logging.info(f"Доступные loopback устройства ({len(loopback_devices)}):")
+            for i, loopback in enumerate(loopback_devices):
+                logging.info(f"  {i}: {loopback['name']}")
+
+            # Пробуем найти устройство с "Game" или "Chat" в названии (скорее всего активное)
+            for loopback in loopback_devices:
+                loopback_name = loopback["name"].lower()
+                if (
+                    "game" in loopback_name
+                    or "chat" in loopback_name
+                    or "speakers" in loopback_name
+                ):
+                    logging.info(
+                        f"Используем вероятно активное loopback устройство: {loopback['name']}"
+                    )
+                    return loopback
+
+            # По умолчанию - первое доступное loopback устройство
+            logging.info(
+                f"Используется первое loopback устройство: {loopback_devices[0]['name']}"
+            )
+            return loopback_devices[0]
+
+        raise RuntimeError(
+            "Не найдено loopback устройство для захвата системного звука"
+        )
+
+    def _find_microphone_device(self, p):
+        """Находит микрофонное устройство."""
+        # Пробуем использовать сохраненные настройки
+        audio_input_device_id = self.config.get("audio_input_device_id", -1)
+        audio_input_device = self.config.get("audio_input_device", "")
+
+        # Сначала по индексу
+        if audio_input_device_id >= 0:
+            try:
+                device = p.get_device_info_by_index(audio_input_device_id)
+                if device["maxInputChannels"] > 0:
+                    logging.info(f"Найден микрофон по индексу: {device['name']}")
+                    return device
+            except Exception as e:
+                logging.warning(
+                    f"Ошибка при доступе к микрофону {audio_input_device_id}: {e}"
+                )
+
+        # Затем по имени
+        if audio_input_device:
+            for i in range(p.get_device_count()):
+                device = p.get_device_info_by_index(i)
+                if (
+                    device["maxInputChannels"] > 0
+                    and audio_input_device.lower() in device["name"].lower()
+                ):
+                    logging.info(f"Найден микрофон по имени: {device['name']}")
+                    return device
+
+        # Микрофон по умолчанию
+        try:
+            default_mic = p.get_default_input_device_info()
+            logging.info(f"Используется микрофон по умолчанию: {default_mic['name']}")
+            return default_mic
+        except Exception as e:
+            logging.error(f"Не удалось получить микрофон по умолчанию: {e}")
+            raise RuntimeError("Не найдено микрофонное устройство")
+
+    def start_recording(self, save_path, blocksize=None):
+        """Начинает запись аудио."""
+        self.recording = True
+        self.stop_event.clear()
+        self.mp3_path = save_path
+        # Используем blocksize из конфига, если не передан явно
+        if blocksize is None:
+            self.blocksize = self.config.get("blocksize", 16384)
+        else:
+            self.blocksize = blocksize
+
+        self.thread = threading.Thread(target=self._record)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def stop_recording(self):
+        """Останавливает запись."""
+        self.recording = False
+        self.stop_event.set()
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3.0)
+
+            if self.thread.is_alive():
+                logging.warning("Поток записи не завершился, принудительная очистка...")
+                self._cleanup_resources()
+
+    def _cleanup_resources(self):
+        """Очищает все ресурсы."""
+        try:
+            # Закрываем потоки с проверкой состояния
+            for key in ["sys_stream", "mic_stream"]:
+                stream = self._resources.get(key)
+                if stream:
+                    try:
+                        # Пытаемся остановить поток, если он активен
+                        if hasattr(stream, "is_active"):
+                            if stream.is_active():
+                                try:
+                                    stream.stop_stream()
+                                except Exception as stop_e:
+                                    # Игнорируем ошибки остановки
+                                    pass
+
+                        # Закрываем поток
+                        stream.close()
+                    except Exception as e:
+                        # Игнорируем ошибки "Stream not open" и подобные
+                        error_str = str(e).lower()
+                        if "not open" not in error_str and "closed" not in error_str:
+                            logging.warning(f"Ошибка при закрытии потока {key}: {e}")
+                    finally:
+                        # Убираем ссылку
+                        self._resources[key] = None
+
+            # Закрываем файлы
+            for key in ["mp3_file", "debug_file"]:
+                file_obj = self._resources.get(key)
+                if file_obj:
+                    try:
+                        file_obj.close()
+                    except Exception as e:
+                        logging.warning(f"Ошибка при закрытии файла {key}: {e}")
+                    finally:
+                        self._resources[key] = None
+
+            # Завершаем PyAudio
+            p = self._resources.get("pyaudio_instance")
+            if p:
+                try:
+                    p.terminate()
+                except Exception as e:
+                    logging.warning(f"Ошибка при завершении PyAudio: {e}")
+                finally:
+                    self._resources["pyaudio_instance"] = None
+
+        except Exception as e:
+            logging.error(f"Ошибка при очистке ресурсов: {e}")
+
+    def _record(self):
+        """Основной метод записи."""
+        logger = logging.getLogger(__name__)
+        logger.info(f"Начало записи аудио в файл: {self.mp3_path}")
+
+        self.stats["start_time"] = time.time()
+
+        p = None
+        sys_stream = None
+        mic_stream = None
+        mp3_file = None
+        encoder = None
+        recording_error = None
+
+        try:
+            # Инициализация PyAudio
+            p = pyaudio.PyAudio()
+            self._resources["pyaudio_instance"] = p
+
+            # Определение частот дискретизации
+            self.base_sample_rate, self.sys_sample_rate, self.mic_sample_rate = (
+                self._determine_sample_rates(p)
+            )
+
+            # Настройка ресемплеров
+            self._setup_resamplers()
+
+            # Поиск устройств
+            loopback_device = self._find_loopback_device(p)
+            mic_device = self._find_microphone_device(p)
+
+            # Открываем потоки
+            sys_stream = p.open(
+                format=pyaudio.paInt16,
+                channels=loopback_device["maxInputChannels"],
+                rate=int(self.sys_sample_rate),
+                input=True,
+                input_device_index=loopback_device["index"],
+                frames_per_buffer=self.blocksize,
+            )
+            self._resources["sys_stream"] = sys_stream
+
+            mic_stream = p.open(
+                format=pyaudio.paInt16,
+                channels=mic_device["maxInputChannels"],
+                rate=int(self.mic_sample_rate),
+                input=True,
+                input_device_index=mic_device["index"],
+                frames_per_buffer=self.blocksize,
+            )
+            self._resources["mic_stream"] = mic_stream
+
+            # Создаем MP3 encoder
+            encoder = lameenc.Encoder()
+            encoder.set_bit_rate(128)
+            encoder.set_in_sample_rate(int(self.base_sample_rate))
+            encoder.set_channels(2)  # Стерео: левый = системный звук, правый = микрофон
+            encoder.set_quality(5)  # Качество кодирования (как в оригинальном коде)
+
+            # Открываем файл для записи
+            mp3_file = open(self.mp3_path, "wb")
+            self._resources["mp3_file"] = mp3_file
+            self._resources["encoder"] = encoder
+
+            logger.info("Запись начата")
+
+            # Основной цикл записи
+            while self.recording and not self.stop_event.is_set():
+                # Чтение данных из потоков
+                sys_data = sys_stream.read(self.blocksize, exception_on_overflow=False)
+                mic_data = mic_stream.read(self.blocksize, exception_on_overflow=False)
+
+                # Преобразование в numpy массивы с правильной нормализацией
+                sys_array = (
+                    np.frombuffer(sys_data, dtype=np.int16).astype(np.float32) / 32767.0
+                )
+                mic_array = (
+                    np.frombuffer(mic_data, dtype=np.int16).astype(np.float32) / 32767.0
+                )
+
+                # Проверка на пустые данные
+                if len(sys_array) == 0 or len(mic_array) == 0:
+                    continue
+
+                # Преобразование в моно
+                sys_channels = loopback_device["maxInputChannels"]
+                mic_channels = mic_device["maxInputChannels"]
+
+                # Правильное преобразование многоканальных данных в моно
+                if sys_channels > 1:
+                    sys_array_reshaped = sys_array.reshape(-1, sys_channels)
+                    sys_mono = np.mean(sys_array_reshaped, axis=1)
+                else:
+                    sys_mono = sys_array
+
+                if mic_channels > 1:
+                    mic_array_reshaped = mic_array.reshape(-1, mic_channels)
+                    mic_mono = np.mean(mic_array_reshaped, axis=1)
+                else:
+                    mic_mono = mic_array
+
+                # Применяем оконную функцию для сглаживания краев (если включено в конфиге)
+                if self.config.get("apply_window", False):
+                    window_type = self.config.get("window_type", "hann")
+                    window_strength = self.config.get("window_strength", 0.3)
+                    window_mic_only = self.config.get("window_mic_only", True)
+
+                    # Применяем окно только к микрофону или к обоим каналам
+                    if window_mic_only:
+                        # Только микрофон
+                        mic_mono = apply_window(
+                            mic_mono, window_type=window_type, strength=window_strength
+                        )
+                        # Системный звук без окна
+                    else:
+                        # Оба канала
+                        sys_mono = apply_window(
+                            sys_mono, window_type=window_type, strength=window_strength
+                        )
+                        mic_mono = apply_window(
+                            mic_mono, window_type=window_type, strength=window_strength
+                        )
+
+                # Ресемплинг если требуется
+                sys_resampled = self._resample_if_needed(
+                    sys_mono,
+                    self.sys_resampler,
+                    self.sys_sample_rate,
+                    self.base_sample_rate,
+                )
+                mic_resampled = self._resample_if_needed(
+                    mic_mono,
+                    self.mic_resampler,
+                    self.mic_sample_rate,
+                    self.base_sample_rate,
+                )
+
+                # Обновление статистики
+                self.stats["sys_samples"] += len(sys_mono)
+                self.stats["mic_samples"] += len(mic_mono)
+                if self.sys_resampler:
+                    self.stats["sys_resampled"] += len(sys_resampled)
+                if self.mic_resampler:
+                    self.stats["mic_resampled"] += len(mic_resampled)
+
+                # Создание стерео данных (левый = системный, правый = микрофон)
+                # Выравнивание длин массивов
+                min_len = min(len(sys_resampled), len(mic_resampled))
+                if min_len > 0:
+                    # Создаем стерео массив
+                    stereo_float = np.column_stack(
+                        [sys_resampled[:min_len], mic_resampled[:min_len]]
+                    ).flatten()
+
+                    # Преобразуем float32 (-1.0 to 1.0) обратно в int16 для encoder
+                    stereo_int16 = (stereo_float * 32767.0).astype(np.int16)
+
+                    # Кодирование в MP3
+                    mp3_chunk = encoder.encode(stereo_int16.tobytes())
+                    if mp3_chunk:
+                        mp3_file.write(mp3_chunk)
+
+                # Обновление буфера для мониторинга
+                with self.recent_audio_lock:
+                    self.recent_audio_buffer = (
+                        stereo_float[: min_len * 2].reshape(-1, 2)
+                        if min_len > 0
+                        else None
+                    )
+
+            # Завершение записи
+            logger.info("Завершение записи...")
+
+            # Финальный flush encoder
+            try:
+                final_chunk = encoder.flush()
+                if final_chunk:
+                    mp3_file.write(final_chunk)
+            except Exception as e:
+                logger.warning(f"Ошибка при flush encoder: {e}")
+
+            self.stats["end_time"] = time.time()
+            duration = self.stats["end_time"] - self.stats["start_time"]
+            logger.info(f"Запись завершена. Длительность: {duration:.2f} сек")
+            logger.info(
+                f"Статистика: системных сэмплов: {self.stats['sys_samples']}, микрофонных: {self.stats['mic_samples']}"
+            )
+
+        except Exception as e:
+            logger.error(f"Ошибка при записи: {e}")
+            logger.error(traceback.format_exc())
+            recording_error = str(e)
+            # Устанавливаем end_time даже при ошибке
+            if self.stats.get("end_time") is None:
+                self.stats["end_time"] = time.time()
+        finally:
+            # Убедимся, что end_time установлен
+            if self.stats.get("end_time") is None:
+                self.stats["end_time"] = time.time()
+
+            # Очистка ресурсов
+            self._cleanup_resources()
+
+            # Вызов callback
+            if self.on_finish:
+                try:
+                    if recording_error:
+                        # Была ошибка при записи
+                        self.on_finish(False, None, recording_error)
+                    else:
+                        # Определяем успешность записи
+                        success = (
+                            self.stats.get("sys_samples", 0) > 0
+                            or self.stats.get("mic_samples", 0) > 0
+                        )
+                        error_msg = None if success else "Запись не удалась: нет данных"
+                        self.on_finish(success, self.mp3_path, error_msg)
+                except Exception as e:
+                    logger.error(f"Ошибка в callback: {e}")
 
     def get_recent_audio(self):
-        """
-        Возвращает последние аудиоданные для мониторинга VU-метром.
-        Возвращает numpy array формы (samples, channels) или None, если данных нет.
-        """
+        """Возвращает последние аудиоданные для мониторинга."""
         with self.recent_audio_lock:
             return self.recent_audio_buffer
 
     def check_devices_available(self):
-        """
-        Проверяет доступность аудиоустройств (loopback и микрофона).
-        Возвращает словарь с информацией о доступных устройствах.
-        """
-        import pyaudiowpatch as pyaudio
-
+        """Проверяет доступность аудиоустройств."""
         p = None
         try:
             p = pyaudio.PyAudio()
@@ -155,16 +755,23 @@ class AudioRecorder:
                 return result
 
             # Поиск loopback устройств
-            loopback_devices = list(p.get_loopback_device_info_generator())
-            result["loopback_devices"] = loopback_devices
-            result["loopback_available"] = len(loopback_devices) > 0
+            try:
+                loopback_devices = list(p.get_loopback_device_info_generator())
+                result["loopback_devices"] = loopback_devices
+                result["loopback_available"] = len(loopback_devices) > 0
+            except Exception as e:
+                result["errors"].append(f"Ошибка при поиске loopback устройств: {e}")
 
             # Поиск микрофонов
             mic_devices = []
             for i in range(p.get_device_count()):
-                device = p.get_device_info_by_index(i)
-                if device["maxInputChannels"] > 0:
-                    mic_devices.append(device)
+                try:
+                    device = p.get_device_info_by_index(i)
+                    if device["maxInputChannels"] > 0:
+                        mic_devices.append(device)
+                except Exception as e:
+                    result["errors"].append(f"Ошибка при получении устройства {i}: {e}")
+
             result["microphone_devices"] = mic_devices
             result["microphone_available"] = len(mic_devices) > 0
 
@@ -185,51 +792,8 @@ class AudioRecorder:
                 p.terminate()
 
     def get_available_devices(self, force_refresh=False):
-        """
-        Возвращает структурированные данные об аудиоустройствах системы.
-
-        Args:
-            force_refresh (bool): Если True, игнорирует кэш и обновляет список устройств.
-
-        Returns:
-            dict: Словарь с отдельными списками для выходных (loopback) и входных (микрофон) устройств.
-                Структура:
-                {
-                    "output_devices": [
-                        {
-                            "name": str,
-                            "index": int,
-                            "channels": int,
-                            "sample_rate": float,
-                            "default_sample_rate": float,
-                            "host_api": str,
-                            "is_default": bool
-                        },
-                        ...
-                    ],
-                    "input_devices": [
-                        {
-                            "name": str,
-                            "index": int,
-                            "channels": int,
-                            "sample_rate": float,
-                            "default_sample_rate": float,
-                            "host_api": str,
-                            "is_default": bool
-                        },
-                        ...
-                    ],
-                    "default_output_index": int,
-                    "default_input_index": int,
-                    "cache_timestamp": float,
-                    "errors": list[str]
-                }
-        """
-        import pyaudiowpatch as pyaudio
+        """Возвращает структурированные данные об аудиоустройствах системы."""
         import time
-        import logging
-
-        logger = logging.getLogger(__name__)
 
         # Кэширование результатов
         if not hasattr(self, "_devices_cache"):
@@ -243,7 +807,6 @@ class AudioRecorder:
             and self._devices_cache is not None
             and (time.time() - self._devices_cache_timestamp) < cache_ttl
         ):
-            # logger.debug("Используется кэшированный список устройств")  # сокращение логов
             return self._devices_cache
 
         p = None
@@ -257,15 +820,6 @@ class AudioRecorder:
                 "cache_timestamp": time.time(),
                 "errors": [],
             }
-
-            # Получаем информацию о хостах
-            host_apis = {}
-            for i in range(p.get_host_api_count()):
-                try:
-                    host_info = p.get_host_api_info_by_index(i)
-                    host_apis[host_info["index"]] = host_info["name"]
-                except Exception as e:
-                    logger.warning(f"Не удалось получить информацию о хосте {i}: {e}")
 
             # Получаем устройства по умолчанию
             try:
@@ -303,9 +857,7 @@ class AudioRecorder:
                         "default_sample_rate": float(
                             device_info.get("defaultSampleRate", 44100.0)
                         ),
-                        "host_api": host_apis.get(
-                            device_info.get("hostApi", -1), "Unknown"
-                        ),
+                        "host_api": "WASAPI",
                         "is_default": (
                             i == result["default_output_index"]
                             or i == result["default_input_index"]
@@ -317,22 +869,17 @@ class AudioRecorder:
                     max_output = device_info.get("maxOutputChannels", 0)
 
                     if max_output > 0:
-                        # Это устройство вывода (может быть loopback)
                         device_data["type"] = "output"
                         result["output_devices"].append(device_data)
 
                     if max_input > 0:
-                        # Это устройство ввода (микрофон)
                         device_data["type"] = "input"
                         result["input_devices"].append(device_data)
 
                 except Exception as e:
-                    logger.error(
-                        f"Ошибка при получении информации об устройстве {i}: {e}"
-                    )
                     result["errors"].append(f"Устройство {i}: {e}")
 
-            # Добавляем loopback устройства (специальные устройства записи вывода)
+            # Добавляем loopback устройства
             try:
                 loopback_devices = list(p.get_loopback_device_info_generator())
                 for lb_device in loopback_devices:
@@ -353,1072 +900,18 @@ class AudioRecorder:
                     }
                     result["output_devices"].append(device_data)
             except Exception as e:
-                logger.warning(f"Не удалось получить loopback устройства: {e}")
                 result["errors"].append(f"Loopback устройства: {e}")
 
             # Сохраняем в кэш
             self._devices_cache = result
             self._devices_cache_timestamp = time.time()
 
-            logger.info(
-                f"Получено {len(result['output_devices'])} выходных и {len(result['input_devices'])} входных устройств"
-            )
             return result
 
         except Exception as e:
-            logger.error(f"Критическая ошибка при получении списка устройств: {e}")
             if p:
                 p.terminate()
             raise
         finally:
             if p:
                 p.terminate()
-
-    def start_recording(self, save_path, blocksize=1024):
-        self.recording = True
-        self.stop_event.clear()
-        self.mp3_path = save_path
-        self.blocksize = blocksize
-        self.thread = threading.Thread(target=self._record)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def stop_recording(self):
-        """Останавливает запись с гарантированным освобождением ресурсов.
-
-        Использует упрощенную многоуровневую стратегию остановки:
-        1. Установка флагов остановки
-        2. Ожидание корректного завершения с таймаутом
-        3. Принудительное прерывание потоков PyAudio при зависании
-        4. Гарантированная очистка ресурсов
-        """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        self.recording = False
-        self.stop_event.set()
-
-        # Сохраняем ссылки на ресурсы для принудительной очистки
-        # (будут установлены в _record)
-        self._force_cleanup_resources = getattr(self, "_force_cleanup_resources", {})
-
-        # Логирование состояния потоков перед остановкой
-        resources = self._force_cleanup_resources
-        if "sys_stream" in resources and resources["sys_stream"]:
-            stream = resources["sys_stream"]
-            is_active = hasattr(stream, "is_active") and stream.is_active()
-            # logger.debug(f"Состояние системного потока перед остановкой: активен={is_active}")  # сокращение логов
-        if "mic_stream" in resources and resources["mic_stream"]:
-            stream = resources["mic_stream"]
-            is_active = hasattr(stream, "is_active") and stream.is_active()
-            # logger.debug(f"Состояние микрофонного потока перед остановкой: активен={is_active}")  # сокращение логов
-
-        # Ожидание корректного завершения с прогрессивными таймаутами
-        if self.thread and self.thread.is_alive():
-            logger.info("Ожидание завершения потока записи...")
-
-            # Первая попытка: короткий таймаут для быстрого завершения
-            self.thread.join(timeout=1.5)
-
-            if self.thread.is_alive():
-                logger.warning(
-                    "Поток не завершился за 1.5 секунды, попытка принудительной остановки потоков PyAudio..."
-                )
-
-                # Вторая попытка: принудительная остановка потоков PyAudio
-                self._abort_pyaudio_streams()
-
-                # Даем время на реакцию
-                self.thread.join(timeout=1.0)
-
-                if self.thread.is_alive():
-                    logger.error(
-                        "Поток все еще жив после принудительной остановки, применение агрессивной очистки..."
-                    )
-
-                    # Третья попытка: агрессивная очистка ресурсов
-                    self._guaranteed_cleanup()
-
-                    # Финальное ожидание
-                    self.thread.join(timeout=0.5)
-
-                    if self.thread.is_alive():
-                        logger.critical(
-                            "Поток записи не отвечает даже после агрессивной очистки. Возможно зависание в системном вызове."
-                        )
-                        # На этом этапе мы не можем сделать больше, но гарантируем,
-                        # что ресурсы были освобождены насколько это возможно
-                    else:
-                        logger.info("Поток завершен после агрессивной очистки.")
-                else:
-                    logger.info(
-                        "Поток завершен после принудительной остановки потоков PyAudio."
-                    )
-            else:
-                logger.info("Поток записи корректно завершен.")
-        else:
-            logger.info("Поток записи не активен.")
-
-    def _flush_with_timeout(self, encoder, timeout=2.0):
-        """
-        Выполняет encoder.flush() с ограничением по времени и механизмом принудительного прерывания.
-
-        Использует прогрессивную стратегию:
-        1. Попытка стандартного flush с таймаутом
-        2. При зависании - попытка прервать через отдельный поток
-        3. Принудительное завершение с восстановлением управления
-
-        Args:
-            encoder: экземпляр lameenc.Encoder
-            timeout: максимальное время ожидания в секундах
-
-        Returns:
-            bytes или None: данные MP3 или None в случае таймаута/ошибки
-        """
-        import threading
-        import time
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        result = []
-        error = []
-        flush_completed = threading.Event()
-
-        def worker():
-            try:
-                # logger.debug("Начало encoder.flush()...")  # сокращение логов
-                chunk = encoder.flush()
-                result.append(chunk)
-                # logger.debug("encoder.flush() успешно завершен")  # сокращение логов
-            except Exception as e:
-                error.append(e)
-                logger.error(f"Ошибка в encoder.flush(): {e}")
-            finally:
-                flush_completed.set()
-
-        # Запускаем поток с flush
-        thread = threading.Thread(target=worker)
-        thread.daemon = True
-        thread.start()
-
-        # Ожидаем завершения с прогрессивными таймаутами
-        wait_time = timeout
-        start_time = time.time()
-
-        while wait_time > 0 and not flush_completed.is_set():
-            # Проверяем каждые 0.1 секунды для более отзывчивого прерывания
-            check_interval = 0.1
-            flush_completed.wait(check_interval)
-            elapsed = time.time() - start_time
-            wait_time = timeout - elapsed
-
-            # Проверяем stop_event для возможности прервать операцию
-            if hasattr(self, "stop_event") and self.stop_event.is_set():
-                logger.warning(
-                    "Обнаружен stop_event во время flush, попытка прервать операцию..."
-                )
-                # Прерываем ожидание, но даем flush шанс завершиться
-                break
-
-        if thread.is_alive():
-            # Поток все еще работает - зависание
-            logger.warning(
-                f"encoder.flush() завис после {elapsed:.1f} секунд, применение стратегии восстановления..."
-            )
-
-            # Стратегия 1: Попытка мягкого прерывания через stop_event
-            if hasattr(self, "stop_event"):
-                self.stop_event.set()
-                # Даем дополнительное время для реакции
-                thread.join(timeout=0.5)
-
-            if thread.is_alive():
-                # Стратегия 2: Принудительное завершение потока (опасно, но необходимо)
-                logger.error("Принудительное завершение потока flush из-за зависания")
-                # В Python нет безопасного способа убить поток, но мы можем
-                # пометить операцию как неудачную и продолжить
-                # Записываем предупреждение в лог
-                return None
-            else:
-                logger.info("Поток flush завершился после мягкого прерывания")
-                return result[0] if result else None
-        elif error:
-            # Произошла ошибка при flush
-            logger.error(f"Ошибка при encoder.flush(): {error[0]}")
-            return None
-        else:
-            # Успешное завершение
-            # logger.debug(f"encoder.flush() завершен за {elapsed:.1f} секунд")  # сокращение логов
-            return result[0] if result else None
-
-    def _safe_stream_read(self, stream, num_frames, timeout_ms=1000):
-        """
-        Безопасное чтение из потока PyAudio с таймаутом и проверкой stop_event.
-
-        Args:
-            stream: поток PyAudio (может быть None)
-            num_frames: количество фреймов для чтения
-            timeout_ms: таймаут в миллисекундах
-
-        Returns:
-            tuple: (data, overflow) или (None, False) в случае таймаута/ошибки
-        """
-        import time
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        # Если поток None (микрофон недоступен), возвращаем None
-        if stream is None:
-            logger.debug("Поток None, пропускаем чтение")
-            return None, False
-
-        # Проверяем, активен ли поток перед чтением
-        if hasattr(stream, "is_active") and not stream.is_active():
-            logger.warning("Попытка чтения из неактивного потока")
-            return None, False
-
-        # Проверяем stop_event перед чтением
-        if hasattr(self, "stop_event") and self.stop_event.is_set():
-            logger.debug("stop_event установлен, пропускаем чтение")
-            return None, False
-
-        start_time = time.time()
-        logger.debug(
-            f"Начало чтения из потока, num_frames={num_frames}, timeout={timeout_ms}мс"
-        )
-        # Запись в debug_file удалена для сокращения логов
-
-        # Пытаемся прочитать с таймаутом и проверкой доступных данных
-        try:
-            # Проверяем, есть ли метод get_stream_read_available
-            available = 0
-            if hasattr(stream, "get_stream_read_available"):
-                available = stream.get_stream_read_available()
-                logger.debug(f"Доступно фреймов для чтения: {available}")
-                # Запись в debug_file удалена для сокращения логов
-
-            # Если доступных данных недостаточно, ждем с проверкой stop_event
-            wait_start = time.time()
-            while available < num_frames:
-                # Проверяем таймаут
-                if (time.time() - start_time) * 1000 > timeout_ms:
-                    logger.warning(
-                        f"Таймаут ожидания данных ({timeout_ms} мс), доступно только {available} фреймов"
-                    )
-                    return None, False
-                # Проверяем stop_event
-                if hasattr(self, "stop_event") and self.stop_event.is_set():
-                    logger.debug("stop_event установлен во время ожидания данных")
-                    return None, False
-                # Короткая пауза
-                time.sleep(0.001)  # 1 мс
-                if hasattr(stream, "get_stream_read_available"):
-                    available = stream.get_stream_read_available()
-                else:
-                    # Если метод недоступен, прерываем цикл
-                    break
-
-            # Чтение данных
-            result = stream.read(
-                num_frames,
-                exception_on_overflow=False,
-            )
-
-            elapsed = time.time() - start_time
-            logger.debug(
-                f"Чтение завершено за {elapsed*1000:.0f} мс, размер данных: {len(result) if result else 0} байт"
-            )
-            return result, False
-
-        except OSError as e:
-            # Специфические ошибки PyAudio (устройство отключено, проблемы с драйвером)
-            logger.error(f"Ошибка ввода-вывода PyAudio при чтении из потока: {e}")
-            return None, False
-        except IOError as e:
-            # Устаревшее исключение, но оставляем для совместимости
-            logger.error(f"Ошибка ввода-вывода при чтении из потока: {e}")
-            return None, False
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка при чтении из потока: {e}")
-            return None, False
-
-    def _abort_pyaudio_streams(self):
-        """
-        Принудительное прерывание потоков PyAudio.
-
-        Использует abort_stream() если доступно, иначе stop_stream().
-        Гарантирует, что потоки будут остановлены даже при зависании.
-        """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        # Получаем ссылки на ресурсы из _record
-        resources = getattr(self, "_force_cleanup_resources", {})
-
-        logger.info("Принудительная остановка потоков PyAudio...")
-
-        # Останавливаем системный поток
-        if "sys_stream" in resources and resources["sys_stream"]:
-            try:
-                stream = resources["sys_stream"]
-                # logger.debug(f"Принудительная остановка sys_stream, тип: {type(stream)}")  # сокращение логов
-                # Безопасная проверка активности потока
-                is_active = False
-                if hasattr(stream, "is_active"):
-                    try:
-                        is_active = stream.is_active()
-                        # logger.debug(f"sys_stream is_active() = {is_active}")  # сокращение логов
-                    except OSError as e:
-                        if "Stream not open" in str(e):
-                            # logger.debug("sys_stream уже закрыт (Stream not open), считаем неактивным")  # сокращение логов
-                            is_active = False
-                        else:
-                            raise
-
-                if is_active:
-                    if hasattr(stream, "abort_stream"):
-                        stream.abort_stream()
-                        # logger.debug("Системный поток прерван через abort_stream()")  # сокращение логов
-                    else:
-                        stream.stop_stream()
-                        # logger.debug("Системный поток остановлен через stop_stream()")  # сокращение логов
-                else:
-                    # logger.debug("Системный поток уже не активен, пропускаем остановку")  # сокращение логов
-                    pass
-            except Exception as e:
-                logger.error(f"Ошибка при остановке системного потока: {e}")
-
-        # Останавливаем микрофонный поток
-        if "mic_stream" in resources and resources["mic_stream"]:
-            try:
-                stream = resources["mic_stream"]
-                # logger.debug(f"Принудительная остановка mic_stream, тип: {type(stream)}")  # сокращение логов
-                # Безопасная проверка активности потока
-                is_active = False
-                if hasattr(stream, "is_active"):
-                    try:
-                        is_active = stream.is_active()
-                        # logger.debug(f"mic_stream is_active() = {is_active}")  # сокращение логов
-                    except OSError as e:
-                        if "Stream not open" in str(e):
-                            # logger.debug("mic_stream уже закрыт (Stream not open), считаем неактивным")  # сокращение логов
-                            is_active = False
-                        else:
-                            raise
-
-                if is_active:
-                    if hasattr(stream, "abort_stream"):
-                        stream.abort_stream()
-                        # logger.debug("Микрофонный поток прерван через abort_stream()")  # сокращение логов
-                    else:
-                        stream.stop_stream()
-                        # logger.debug("Микрофонный поток остановлен через stop_stream()")  # сокращение логов
-                else:
-                    # logger.debug("Микрофонный поток уже не активен, пропускаем остановку")  # сокращение логов
-                    pass
-            except Exception as e:
-                logger.error(f"Ошибка при остановке микрофонного потока: {e}")
-
-        # Закрываем PyAudio instance
-        if "pyaudio_instance" in resources and resources["pyaudio_instance"]:
-            try:
-                p = resources["pyaudio_instance"]
-                p.terminate()
-                # logger.debug("Экземпляр PyAudio завершен")  # сокращение логов
-            except Exception as e:
-                logger.error(f"Ошибка при завершении PyAudio: {e}")
-
-    def _guaranteed_cleanup(self):
-        """
-        Гарантированное освобождение всех ресурсов даже при ошибках.
-
-        Выполняет:
-        1. Закрытие всех потоков PyAudio
-        2. Закрытие файлов
-        3. Освобождение других ресурсов
-        4. Логирование состояния
-        """
-        import logging
-        import traceback
-
-        logger = logging.getLogger(__name__)
-        logger.info("Выполнение гарантированной очистки ресурсов...")
-
-        # Получаем ссылки на ресурсы из _record
-        resources = getattr(self, "_force_cleanup_resources", {})
-
-        # 1. Закрытие файлов
-        file_resources = ["mp3_file", "raw_mic_file", "debug_file"]
-        for resource_name in file_resources:
-            if resource_name in resources and resources[resource_name]:
-                try:
-                    file_obj = resources[resource_name]
-                    if hasattr(file_obj, "close") and not file_obj.closed:
-                        file_obj.close()
-                        logger.debug(f"Файл {resource_name} закрыт")
-                except Exception as e:
-                    logger.error(f"Ошибка при закрытии файла {resource_name}: {e}")
-                    traceback.print_exc()
-
-        # 2. Остановка и закрытие потоков PyAudio
-        stream_resources = ["sys_stream", "mic_stream"]
-        for stream_name in stream_resources:
-            if stream_name in resources and resources[stream_name]:
-                try:
-                    stream = resources[stream_name]
-                    logger.debug(f"Обработка потока {stream_name}, тип: {type(stream)}")
-
-                    # Безопасная проверка активности потока с обработкой OSError
-                    is_active = False
-                    if hasattr(stream, "is_active"):
-                        try:
-                            is_active = stream.is_active()
-                            logger.debug(
-                                f"Поток {stream_name} is_active() = {is_active}"
-                            )
-                        except OSError as e:
-                            if "Stream not open" in str(e):
-                                logger.debug(
-                                    f"Поток {stream_name} уже закрыт (Stream not open), считаем неактивным"
-                                )
-                                is_active = False
-                            else:
-                                raise
-
-                    # Останавливаем поток только если активен
-                    if is_active:
-                        if hasattr(stream, "abort_stream"):
-                            stream.abort_stream()
-                            logger.debug(
-                                f"Поток {stream_name} прерван через abort_stream()"
-                            )
-                        elif hasattr(stream, "stop_stream"):
-                            stream.stop_stream()
-                            logger.debug(
-                                f"Поток {stream_name} остановлен через stop_stream()"
-                            )
-                    else:
-                        logger.debug(
-                            f"Поток {stream_name} уже не активен, пропускаем остановку"
-                        )
-
-                    # Закрываем поток
-                    if hasattr(stream, "close"):
-                        stream.close()
-                        logger.debug(f"Поток {stream_name} закрыт")
-
-                    logger.debug(f"Поток {stream_name} обработка завершена")
-                except Exception as e:
-                    logger.error(f"Ошибка при остановке потока {stream_name}: {e}")
-                    traceback.print_exc()
-
-        # 3. Завершение экземпляра PyAudio
-        if "pyaudio_instance" in resources and resources["pyaudio_instance"]:
-            try:
-                p = resources["pyaudio_instance"]
-                if hasattr(p, "terminate"):
-                    p.terminate()
-                logger.debug("Экземпляр PyAudio завершен")
-            except Exception as e:
-                logger.error(f"Ошибка при завершении PyAudio: {e}")
-                traceback.print_exc()
-
-        # 4. Освобождение других ресурсов
-        if "encoder" in resources and resources["encoder"]:
-            try:
-                # LAME encoder не требует явного закрытия
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при освобождении encoder: {e}")
-
-        logger.info("Гарантированная очистка ресурсов завершена")
-
-    def _record(self):
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.info(f"Начало записи аудио в файл: {self.mp3_path}")
-
-        log_dir = os.path.join(os.path.dirname(self.mp3_path), "log")
-        os.makedirs(log_dir, exist_ok=True)
-        debug_filename = os.path.join(
-            log_dir, f"debug_audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        )
-        debug_file = open(debug_filename, "w", encoding="utf-8")
-        debug_file.write("=== НАЧАЛО ЗАПИСИ (ПОТОКОВЫЙ РЕСЕМПЛИНГ) ===\n")
-        self._force_cleanup_resources["debug_file"] = debug_file
-        self.debug_file = debug_file  # для доступа из _safe_stream_read
-
-        # Инициализация словаря для гарантированной очистки ресурсов
-        self._force_cleanup_resources = (
-            self._force_cleanup_resources
-        )  # уже инициализирован
-
-        p = None
-        sys_stream = None
-        mic_stream = None
-        mp3_file = None
-        encoder = None
-        raw_mic_enabled = self.config.get("raw_microphone_recording", False)
-        raw_mic_file = None
-        try:
-            debug_file.write("1. Инициализация PyAudio...\n")
-            p = pyaudio.PyAudio()
-            self._force_cleanup_resources["pyaudio_instance"] = p
-
-            # --- Определяем устройства ---
-            debug_file.write("2. Получение WASAPI хоста...\n")
-            try:
-                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-            except OSError as e:
-                raise RuntimeError(f"WASAPI не доступен: {e}")
-
-            default_speakers = p.get_device_info_by_index(
-                wasapi_info["defaultOutputDevice"]
-            )
-            debug_file.write(f"   Динамики: {default_speakers['name']}\n")
-
-            # Поиск loopback с поддержкой сохраненных настроек аудио
-            loopback_device = None
-            audio_output_device_id = self.config.get("audio_output_device_id", -1)
-            audio_output_device = self.config.get("audio_output_device", "")
-
-            # Сначала попробуем использовать сохраненный индекс, если он указан и является loopback
-            if audio_output_device_id >= 0:
-                debug_file.write(
-                    f"   Проверка сохраненного выходного устройства по индексу: {audio_output_device_id}\n"
-                )
-                try:
-                    device = p.get_device_info_by_index(audio_output_device_id)
-                    # Проверяем, является ли устройство loopback (имеет входные каналы и имя содержит loopback?)
-                    # Просто проверим, есть ли устройство в списке loopback
-                    for loopback in p.get_loopback_device_info_generator():
-                        if loopback["index"] == audio_output_device_id:
-                            loopback_device = loopback
-                            debug_file.write(
-                                f"   Найдено loopback по сохраненному индексу: {loopback['name']}\n"
-                            )
-                            break
-                    if loopback_device is None:
-                        debug_file.write(
-                            f"   Устройство с индексом {audio_output_device_id} не является loopback устройством\n"
-                        )
-                except OSError as e:
-                    debug_file.write(
-                        f"   Ошибка при доступе к устройству с индексом {audio_output_device_id}: {e}\n"
-                    )
-
-            # Если не нашли по индексу, ищем по имени
-            if loopback_device is None and audio_output_device:
-                debug_file.write(
-                    f"   Поиск loopback по имени: '{audio_output_device}'\n"
-                )
-                for loopback in p.get_loopback_device_info_generator():
-                    if audio_output_device.lower() in loopback["name"].lower():
-                        loopback_device = loopback
-                        debug_file.write(
-                            f"   Найдено loopback по имени: {loopback['name']}\n"
-                        )
-                        break
-
-            # Если всё ещё не найдено, используем старую логику (по умолчанию)
-            if loopback_device is None:
-                debug_file.write(
-                    "   Поиск loopback по умолчанию (по имени динамиков)\n"
-                )
-                for loopback in p.get_loopback_device_info_generator():
-                    if default_speakers["name"] in loopback["name"]:
-                        loopback_device = loopback
-                        debug_file.write(f"   Найдено loopback: {loopback['name']}\n")
-                        break
-
-            if loopback_device is None:
-                raise RuntimeError("Не найдено устройство захвата системного звука.")
-
-            # Микрофон - улучшенный выбор с поддержкой новых настроек аудио
-            mic_info = None
-            self._mic_unavailable = False
-
-            # Получаем настройки из конфигурации
-            audio_input_device_id = self.config.get("audio_input_device_id", -1)
-            audio_input_device = self.config.get("audio_input_device", "")
-            mic_device_name = self.config.get(
-                "microphone_device_name", ""
-            )  # для обратной совместимости
-
-            # Логируем только выбранные устройства (сокращение объема логов)
-
-            # Шаг 1: Попытка использовать сохраненный индекс устройства
-            if audio_input_device_id >= 0:
-                debug_file.write(
-                    f"   Поиск микрофона по индексу: {audio_input_device_id}\n"
-                )
-                try:
-                    device = p.get_device_info_by_index(audio_input_device_id)
-                    if device["maxInputChannels"] > 0:
-                        mic_info = device
-                        debug_file.write(
-                            f"   Найден микрофон по индексу: {device['name']}\n"
-                        )
-                    else:
-                        debug_file.write(
-                            f"   Устройство с индексом {audio_input_device_id} не является микрофоном (нет входных каналов)\n"
-                        )
-                except OSError as e:
-                    debug_file.write(
-                        f"   Ошибка при доступе к устройству с индексом {audio_input_device_id}: {e}\n"
-                    )
-
-            # Шаг 2: Если индекс не сработал, ищем по имени
-            if mic_info is None and audio_input_device:
-                debug_file.write(
-                    f"   Поиск микрофона по имени: '{audio_input_device}'\n"
-                )
-                for i in range(p.get_device_count()):
-                    device = p.get_device_info_by_index(i)
-                    if (
-                        device["maxInputChannels"] > 0
-                        and audio_input_device.lower() in device["name"].lower()
-                    ):
-                        mic_info = device
-                        debug_file.write(
-                            f"   Найден микрофон по имени: {device['name']}\n"
-                        )
-                        break
-
-            # Шаг 3: Обратная совместимость с старым ключом microphone_device_name
-            if mic_info is None and mic_device_name:
-                debug_file.write(
-                    f"   Поиск микрофона по устаревшему имени: '{mic_device_name}'\n"
-                )
-                for i in range(p.get_device_count()):
-                    device = p.get_device_info_by_index(i)
-                    if (
-                        device["maxInputChannels"] > 0
-                        and mic_device_name.lower() in device["name"].lower()
-                    ):
-                        mic_info = device
-                        debug_file.write(f"   Найден микрофон: {device['name']}\n")
-                        break
-
-            # Шаг 4: Если не найден по имени или имя не указано, используем устройство по умолчанию
-            if mic_info is None:
-                debug_file.write("   Используется микрофон по умолчанию\n")
-                try:
-                    mic_info = p.get_default_input_device_info()
-                except OSError as e:
-                    debug_file.write(
-                        f"   ОШИБКА: микрофон по умолчанию недоступен: {e}\n"
-                    )
-                    # Создаем заглушку для микрофона с параметрами системного устройства
-                    # чтобы запись могла продолжиться (только системный звук)
-                    debug_file.write("   СОЗДАНИЕ ЗАГЛУШКИ ДЛЯ МИКРОФОНА\n")
-                    # Используем параметры системного устройства как заглушку
-                    mic_info = {
-                        "name": "VIRTUAL_MICROPHONE (заглушка)",
-                        "index": -1,
-                        "defaultSampleRate": loopback_device["defaultSampleRate"],
-                        "maxInputChannels": 1,
-                        "hostApi": 0,
-                    }
-                    # Устанавливаем флаг, что микрофон недоступен
-                    self._mic_unavailable = True
-                else:
-                    self._mic_unavailable = False
-            else:
-                self._mic_unavailable = False
-
-            debug_file.write(
-                f"   Выбранный микрофон: {mic_info['name']} (индекс: {mic_info['index']})\n"
-            )
-
-            # Параметры устройств
-            fs_sys = int(loopback_device["defaultSampleRate"])
-            fs_mic = int(mic_info["defaultSampleRate"])
-            channels_sys = loopback_device["maxInputChannels"]
-            channels_mic = mic_info["maxInputChannels"]
-            debug_file.write(f"   Системный звук: {fs_sys} Гц, {channels_sys} канала\n")
-            debug_file.write(f"   Микрофон: {fs_mic} Гц, {channels_mic} канала\n")
-
-            # Валидация параметров микрофона
-            mic_parameters_valid = True
-            if fs_mic <= 0:
-                debug_file.write(
-                    f"   ПРЕДУПРЕЖДЕНИЕ: некорректная частота дискретизации микрофона ({fs_mic} Гц)\n"
-                )
-                mic_parameters_valid = False
-            if channels_mic <= 0:
-                debug_file.write(
-                    f"   ПРЕДУПРЕЖДЕНИЕ: некорректное количество каналов микрофона ({channels_mic})\n"
-                )
-                mic_parameters_valid = False
-            if not mic_parameters_valid:
-                debug_file.write(
-                    "   Параметры микрофона некорректны, будет использоваться заглушка (нулевые данные).\n"
-                )
-                # Устанавливаем флаг, что микрофон недоступен
-                self._mic_unavailable = True
-                # Принудительно устанавливаем индекс -1, чтобы поток не открывался
-                mic_info["index"] = -1
-
-            # Целевая частота – максимальная из двух
-            target_fs = max(fs_sys, fs_mic)
-            debug_file.write(f"   Целевая частота: {target_fs} Гц\n")
-
-            # --- Открываем потоки ---
-            debug_file.write("3. Открытие потоков ввода...\n")
-            sys_stream = p.open(
-                format=pyaudio.paFloat32,
-                channels=channels_sys,
-                rate=fs_sys,
-                frames_per_buffer=0,  # используем оптимальный размер буфера
-                input=True,
-                input_device_index=loopback_device["index"],
-            )
-
-            # Проверяем индекс микрофона: если -1, микрофон недоступен, используем заглушку
-            mic_stream = None
-            if mic_info["index"] >= 0:
-                mic_stream = p.open(
-                    format=pyaudio.paFloat32,
-                    channels=channels_mic,
-                    rate=fs_mic,
-                    frames_per_buffer=0,  # используем оптимальный размер буфера
-                    input=True,
-                    input_device_index=mic_info["index"],
-                )
-                debug_file.write("   Микрофонный поток открыт.\n")
-            else:
-                debug_file.write(
-                    "   Микрофон недоступен (индекс -1), будет использоваться заглушка (нулевые данные).\n"
-                )
-                # Устанавливаем флаг, что микрофон недоступен
-                self._mic_unavailable = True
-
-            debug_file.write("   Потоки открыты.\n")
-
-            # Проверяем активность потоков
-            if hasattr(sys_stream, "is_active"):
-                debug_file.write(
-                    f"   Системный поток активен: {sys_stream.is_active()}\n"
-                )
-            if mic_stream and hasattr(mic_stream, "is_active"):
-                debug_file.write(
-                    f"   Микрофонный поток активен: {mic_stream.is_active()}\n"
-                )
-
-            # Сохраняем ссылки на потоки для гарантированной очистки
-            self._force_cleanup_resources["sys_stream"] = sys_stream
-            self._force_cleanup_resources["mic_stream"] = mic_stream
-
-            # --- Инициализация ресемплеров ---
-            sys_ratio = target_fs / fs_sys if fs_sys != target_fs else 1.0
-            mic_ratio = target_fs / fs_mic if fs_mic != target_fs else 1.0
-            sys_resampler = (
-                create_resampler("sinc_best", channels=1)
-                if fs_sys != target_fs
-                else None
-            )
-            mic_resampler = (
-                create_resampler("sinc_best", channels=1)
-                if fs_mic != target_fs
-                else None
-            )
-
-            # --- Инициализация MP3-энкодера ---
-            debug_file.write("4. Инициализация LAME-энкодера...\n")
-            encoder = lameenc.Encoder()
-            encoder.set_bit_rate(128)
-            encoder.set_in_sample_rate(target_fs)
-            encoder.set_channels(1)
-            encoder.set_quality(5)
-            self._force_cleanup_resources["encoder"] = encoder
-
-            mp3_file = open(self.mp3_path, "wb")
-            debug_file.write(f"   MP3-файл открыт: {self.mp3_path}\n")
-            self._force_cleanup_resources["mp3_file"] = mp3_file
-
-            # Открытие файла для записи сырых данных микрофона (если включено)
-            # raw_mic_enabled уже инициализирован перед try-блоком
-            if raw_mic_enabled:
-                raw_mic_path = os.path.join(
-                    log_dir, f"raw_mic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
-                )
-                raw_mic_file = open(raw_mic_path, "wb")
-                debug_file.write(f"   Файл сырых данных микрофона: {raw_mic_path}\n")
-                self._force_cleanup_resources["raw_mic_file"] = raw_mic_file
-
-            # --- Цикл записи ---
-            debug_file.write("5. Начало цикла записи...\n")
-            block_counter = 0
-            start_time = time.time()
-            last_log_time = start_time
-
-            while self.recording and not self.stop_event.is_set():
-                try:
-                    # Логирование входа в итерацию (первые 5 итераций)
-                    if block_counter < 5:
-                        debug_file.write(
-                            f"   Итерация {block_counter}, recording={self.recording}, stop_event={self.stop_event.is_set()}\n"
-                        )
-                        debug_file.flush()
-
-                    # Безопасное чтение с проверкой stop_event между операциями
-                    sys_result, sys_overflow = self._safe_stream_read(
-                        sys_stream, self.blocksize, timeout_ms=500
-                    )
-
-                    # Проверяем stop_event между чтениями
-                    if self.stop_event.is_set():
-                        debug_file.write(
-                            "   Обнаружен stop_event после чтения системного звука, прерывание цикла.\n"
-                        )
-                        break
-
-                    # Чтение микрофона: если поток отсутствует (микрофон недоступен), используем нулевые данные
-                    if mic_stream is not None:
-                        mic_result, mic_overflow = self._safe_stream_read(
-                            mic_stream, self.blocksize, timeout_ms=500
-                        )
-                    else:
-                        # Генерируем нулевые данные для микрофона
-                        mic_result = bytes(
-                            self.blocksize * channels_mic * 4
-                        )  # float32: 4 байта на сэмпл
-                        mic_overflow = False
-                        # Логируем только первые несколько блоков, чтобы не засорять лог
-                        if block_counter < 5:
-                            debug_file.write(
-                                "   Используются нулевые данные для микрофона (микрофон недоступен).\n"
-                            )
-
-                    # Проверяем результаты чтения
-                    if sys_result is None:
-                        debug_file.write(
-                            "   Таймаут или ошибка при чтении системного звука, пропуск блока.\n"
-                        )
-                        debug_file.flush()
-                        continue
-                    if mic_stream is not None and mic_result is None:
-                        debug_file.write(
-                            "   Таймаут или ошибка при чтении микрофона, пропуск блока.\n"
-                        )
-                        debug_file.flush()
-                        continue
-
-                    # Обработка результатов (PyAudio может вернуть tuple или bytes)
-                    if isinstance(sys_result, tuple):
-                        sys_data_block, sys_overflow = sys_result
-                    else:
-                        sys_data_block, sys_overflow = sys_result, False
-                    if isinstance(mic_result, tuple):
-                        mic_data_block, mic_overflow = mic_result
-                    else:
-                        mic_data_block, mic_overflow = mic_result, False
-
-                    if sys_overflow or mic_overflow:
-                        debug_file.write("   Переполнение буфера, блок пропущен.\n")
-                        continue
-
-                    # Преобразуем байты в float32
-                    sys_block = np.frombuffer(sys_data_block, dtype=np.float32).reshape(
-                        -1, channels_sys
-                    )
-                    mic_block = np.frombuffer(mic_data_block, dtype=np.float32).reshape(
-                        -1, channels_mic
-                    )
-
-                    # Сохраняем последние аудиоданные для VU-метра
-                    with self.recent_audio_lock:
-                        self.recent_audio_buffer = mic_block
-
-                    # Усредняем системный звук до моно
-                    sys_mono = np.mean(sys_block, axis=1)
-                    # Усредняем микрофон до моно
-                    mic_mono_raw = np.mean(mic_block, axis=1)
-
-                    # Запись сырых данных микрофона (если включено)
-                    if raw_mic_enabled and raw_mic_file:
-                        # Записываем сырые float32 данные
-                        raw_mic_file.write(mic_mono_raw.astype(np.float32).tobytes())
-
-                    # Ресемплинг
-                    if sys_resampler:
-                        sys_mono = sys_resampler.process(sys_mono, sys_ratio)
-                    if mic_resampler:
-                        mic_mono = mic_resampler.process(mic_mono_raw, mic_ratio)
-                    else:
-                        mic_mono = mic_mono_raw
-
-                    # Приводим к одинаковой длине
-                    min_len = min(len(sys_mono), len(mic_mono))
-                    if min_len == 0:
-                        continue
-                    sys_mono = sys_mono[:min_len]
-                    mic_mono = mic_mono[:min_len]
-
-                    # Нормализация уровня звука перед микшированием
-                    # Получаем параметры нормализации из конфигурации
-                    normalization_enabled = (
-                        False  # отключаем нормализацию из-за проблем с перегрузом
-                    )
-                    target_peak = 0.5
-                    # Параметры усиления микрофона
-                    mic_gain_db = 0.0  # без усиления
-                    mic_max_gain = 100.0
-
-                    # Диагностика уровней сигналов перед нормализацией
-                    sys_peak_raw = np.max(np.abs(sys_mono)) if len(sys_mono) > 0 else 0
-                    mic_peak_raw = np.max(np.abs(mic_mono)) if len(mic_mono) > 0 else 0
-                    sys_rms_raw = (
-                        np.sqrt(np.mean(sys_mono**2)) if len(sys_mono) > 0 else 0
-                    )
-                    mic_rms_raw = (
-                        np.sqrt(np.mean(mic_mono**2)) if len(mic_mono) > 0 else 0
-                    )
-
-                    # Логирование уровней: первые 10 блоков, каждые 500 блоков, при превышении порогов (>1.0)
-                    log_levels = (
-                        (block_counter < 10)
-                        or (block_counter % 500 == 0)
-                        or (sys_peak_raw > 1.0)
-                        or (mic_peak_raw > 1.0)
-                    )
-                    if log_levels:
-                        debug_file.write(
-                            f"   Блок {block_counter}: Sys peak={sys_peak_raw:.6f}, Mic peak={mic_peak_raw:.6f}, "
-                            f"Sys RMS={sys_rms_raw:.6f}, Mic RMS={mic_rms_raw:.6f}, Mic gain={mic_gain_db} dB\n"
-                        )
-
-                    if normalization_enabled:
-                        # Применяем предварительное усиление микрофона
-                        if mic_gain_db != 0:
-                            mic_gain_linear = 10 ** (mic_gain_db / 20)
-                            # Ограничиваем максимальное усиление
-                            mic_gain_linear = min(mic_gain_linear, mic_max_gain)
-                            mic_mono = mic_mono * mic_gain_linear
-                            if log_levels:
-                                mic_peak_after_gain = (
-                                    np.max(np.abs(mic_mono)) if len(mic_mono) > 0 else 0
-                                )
-                                debug_file.write(
-                                    f"   Блок {block_counter}: Усиление микрофона {mic_gain_db} dB ({mic_gain_linear:.1f}x). Mic peak после усиления={mic_peak_after_gain:.6f}\n"
-                                )
-
-                        # Нормализуем системный звук по пиковому значению
-                        sys_mono_normalized = normalize_audio_peak(
-                            sys_mono, target_peak=target_peak
-                        )
-                        # Нормализуем микрофон по пиковому значению с увеличенным максимальным усилением
-                        mic_mono_normalized = normalize_audio_peak(
-                            mic_mono, target_peak=target_peak, max_gain=mic_max_gain
-                        )
-
-                        # Диагностика после нормализации
-                        if log_levels:
-                            sys_peak_norm = (
-                                np.max(np.abs(sys_mono_normalized))
-                                if len(sys_mono_normalized) > 0
-                                else 0
-                            )
-                            mic_peak_norm = (
-                                np.max(np.abs(mic_mono_normalized))
-                                if len(mic_mono_normalized) > 0
-                                else 0
-                            )
-                            debug_file.write(
-                                f"   Блок {block_counter}: Нормализация. Sys peak={sys_peak_norm:.6f}, Mic peak={mic_peak_norm:.6f}\n"
-                            )
-                    else:
-                        # Если нормализация отключена, используем исходные сигналы
-                        sys_mono_normalized = sys_mono
-                        mic_mono_normalized = mic_mono
-                        if log_levels:
-                            debug_file.write(
-                                f"   Блок {block_counter}: Нормализация отключена\n"
-                            )
-
-                    # Микшируем сигналы (нормализованные или исходные)
-                    mixed = (sys_mono_normalized + mic_mono_normalized) * 0.5
-
-                    # Преобразуем в int16
-                    mixed_int16 = (mixed * 32767).astype(np.int16)
-
-                    # Отправляем в MP3-энкодер
-                    mp3_chunk = encoder.encode(mixed_int16.tobytes())
-                    if mp3_chunk:
-                        mp3_file.write(mp3_chunk)
-                        # Принудительный сброс буфера файловой системы каждые 10 блоков
-                        if block_counter % 10 == 0:
-                            try:
-                                mp3_file.flush()
-                                os.fsync(mp3_file.fileno())
-                                # Логируем размер файла для диагностики
-                                current_size = os.path.getsize(self.mp3_path)
-                                debug_file.write(
-                                    f"   Сброс буфера, размер файла: {current_size} байт\n"
-                                )
-                            except Exception as e:
-                                debug_file.write(f"   Ошибка при сбросе буфера: {e}\n")
-
-                    block_counter += 1
-
-                    # Логирование прогресса каждые 100 блоков
-                    if block_counter % 100 == 0:
-                        current_time = time.time()
-                        elapsed = current_time - start_time
-                        debug_file.write(
-                            f"   Прогресс: {block_counter} блоков, время: {elapsed:.1f} сек\n"
-                        )
-
-                except Exception as e:
-                    debug_file.write(f"   Ошибка в цикле: {e}\n")
-                    debug_file.flush()
-                    break
-
-            debug_file.write(f"6. Цикл завершён. Записано блоков: {block_counter}\n")
-
-            # --- Финализация MP3 ---
-            debug_file.write("   Начало финализации MP3 (flush)...\n")
-            mp3_chunk = self._flush_with_timeout(encoder, timeout=2.0)
-            if mp3_chunk:
-                mp3_file.write(mp3_chunk)
-                debug_file.write("   MP3 финализирован успешно.\n")
-            else:
-                debug_file.write(
-                    "   ВНИМАНИЕ: flush завершился с таймаутом или ошибкой, данные могут быть потеряны.\n"
-                )
-
-            # --- Закрытие ---
-            mp3_file.close()
-            # Закрытие файла сырых данных микрофона
-            if raw_mic_enabled and raw_mic_file:
-                raw_mic_file.close()
-                debug_file.write("   Файл сырых данных микрофона закрыт.\n")
-            if sys_stream:
-                sys_stream.stop_stream()
-                sys_stream.close()
-            if mic_stream:
-                mic_stream.stop_stream()
-                mic_stream.close()
-            if p:
-                p.terminate()
-
-            debug_file.write("=== УСПЕХ ===\n")
-            debug_file.close()
-            self.on_finish(True, self.mp3_path, None)
-
-        except Exception as e:
-            debug_file.write(f"!!! ИСКЛЮЧЕНИЕ: {e}\n")
-            traceback.print_exc(file=debug_file)
-            debug_file.flush()
-            debug_file.close()
-            if mp3_file:
-                mp3_file.close()
-            if raw_mic_enabled and raw_mic_file:
-                raw_mic_file.close()
-            self.on_finish(False, None, str(e))
